@@ -33,21 +33,14 @@ func New(rdb redis.Cmdable, prefix string) *Guard {
 func (g *Guard) lockKey(key string) string    { return g.prefix + "lock:" + key }
 func (g *Guard) attemptKey(key string) string { return g.prefix + "attempts:" + key }
 
-// Begin implements leasedwork.Guard.
+// BeginWindow implements leasedwork.Guard.
 //
 // The SETNX is what makes N replicas behave as one: exactly one sweep wins the
-// window, and the losers do nothing at all rather than each adding to the
-// attempt count.
-//
-// The lock and the counter are two round trips, not one script, so a process
-// dying between them holds the lock without having acted. The cost is bounded
-// and self-correcting: one recovery window is skipped and the next sweep after
-// the lock expires proceeds normally. An error on the counter releases the lock
-// explicitly so that case does not even wait out the window.
-func (g *Guard) Begin(ctx context.Context, key string, window, counterTTL time.Duration) (int, bool, error) {
-	lock := g.lockKey(key)
-
-	ok, err := g.rdb.SetNX(ctx, lock, 1, window).Result()
+// window, and the losers do nothing rather than each charging the job an
+// attempt. It is a plain read of the counter — the count is advanced by
+// RecordAttempt, on the worker, when a job is really taken.
+func (g *Guard) BeginWindow(ctx context.Context, key string, window time.Duration) (int, bool, error) {
+	ok, err := g.rdb.SetNX(ctx, g.lockKey(key), 1, window).Result()
 	if err != nil {
 		return 0, false, err
 	}
@@ -55,16 +48,31 @@ func (g *Guard) Begin(ctx context.Context, key string, window, counterTTL time.D
 		return 0, false, nil
 	}
 
+	n, err := g.rdb.Get(ctx, g.attemptKey(key)).Int()
+	if err == redis.Nil {
+		return 0, true, nil // never retried
+	}
+	if err != nil {
+		// The window is claimed but the count is unknown. Release the lock so
+		// the next sweep can retry promptly rather than waiting it out, and
+		// report the error: acting on an unknown count risks an unbounded loop.
+		g.rdb.Del(ctx, g.lockKey(key))
+		return 0, false, err
+	}
+	return n, true, nil
+}
+
+// RecordAttempt implements leasedwork.Guard.
+func (g *Guard) RecordAttempt(ctx context.Context, key string, ttl time.Duration) (int, error) {
 	attempts := g.attemptKey(key)
 	n, err := g.rdb.Incr(ctx, attempts).Result()
 	if err != nil {
-		g.rdb.Del(ctx, lock)
-		return 0, false, err
+		return 0, err
 	}
 	if n == 1 {
-		g.rdb.Expire(ctx, attempts, counterTTL)
+		g.rdb.Expire(ctx, attempts, ttl)
 	}
-	return int(n), true, nil
+	return int(n), nil
 }
 
 // Clear implements leasedwork.Guard. It drops the attempt counter and the

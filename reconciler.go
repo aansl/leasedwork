@@ -36,29 +36,43 @@ type Job struct {
 	Value any
 }
 
-// Guard makes a sweep that runs on every replica behave as if it ran on one.
+// Guard makes a sweep that runs on every replica behave as if it ran on one,
+// and holds the count of how many times a job has actually been retried.
 //
-// This exists because of a specific bug. A reconciler that increments an
-// attempt counter directly, once per replica per sweep, does not enforce the
-// budget it appears to: with three replicas a three-attempt budget is spent in
-// a single 30-second sweep, and with four the fourth replica marks the job
-// permanently failed in the very sweep the other three just re-enqueued it,
-// racing a worker that is about to pick it up and succeed.
+// The split between BeginWindow and RecordAttempt is deliberate and is the fix
+// for two distinct bugs.
 //
-// Begin collapses that back to one action per staleness window.
+// The first: a reconciler that counts an attempt itself, once per replica per
+// sweep, does not enforce the budget it appears to. With three replicas a
+// three-attempt budget is spent in a single sweep, and with four, one replica
+// marks the job permanently failed in the very sweep the other three
+// re-enqueued it — racing a worker about to pick it up and succeed.
+// BeginWindow collapses that to one action per staleness window.
+//
+// The second: counting at sweep time counts *noticing*, not *running*. A queue
+// deep enough that a re-enqueued job waits longer than one window burns the
+// whole budget without the job ever starting, so a backlog fails user work that
+// nothing is actually wrong with. RecordAttempt moves the count to the moment a
+// worker genuinely takes the job, which is the thing worth rationing.
 type Guard interface {
-	// Begin claims the exclusive right to act on key for the next window, and
-	// reports how many times it has been claimed including this one.
+	// BeginWindow claims the exclusive right to act on key for the next window,
+	// and reports how many attempts have been recorded for it so far.
 	//
 	// ok is false when another replica (or an earlier sweep still inside the
 	// window) already holds the claim; the caller must then do nothing at all
-	// for this job — not re-enqueue it, not count it, not fail it.
+	// for this job — not re-enqueue it, not fail it.
 	//
-	// The claim must expire after window on its own. counterTTL bounds the
-	// attempt counter, and should comfortably exceed any single run while being
-	// short enough that a job which recovered weeks ago carries no history into
-	// a new incident.
-	Begin(ctx context.Context, key string, window, counterTTL time.Duration) (attempt int, ok bool, err error)
+	// The claim must expire after window on its own.
+	BeginWindow(ctx context.Context, key string, window time.Duration) (attempts int, ok bool, err error)
+
+	// RecordAttempt counts one real attempt and returns the new total. It is
+	// called by the worker at the moment it claims a job that a previous run
+	// abandoned — never by the sweep.
+	//
+	// ttl bounds the counter: comfortably longer than any single run, short
+	// enough that a job which recovered weeks ago carries no history into a new
+	// incident.
+	RecordAttempt(ctx context.Context, key string, ttl time.Duration) (attempts int, err error)
 
 	// Clear forgets a key's attempt history. Call it when a job reaches a
 	// terminal state: a later manual retry is a new incident deserving its own
@@ -239,7 +253,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 	r.cfg.Logf("[%s] found %d stale job(s)", r.cfg.Name, len(stale))
 
 	for _, job := range stale {
-		attempt, ok, err := r.cfg.Guard.Begin(sweepCtx, job.Key, r.cfg.StaleAfter, r.cfg.AttemptTTL)
+		spent, ok, err := r.cfg.Guard.BeginWindow(sweepCtx, job.Key, r.cfg.StaleAfter)
 		if err != nil {
 			// The guard is the only thing enforcing the ceiling. Without it we
 			// cannot tell attempt 1 from attempt 50, so skip rather than risk an
@@ -248,12 +262,11 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 			continue
 		}
 		if !ok {
-			// Another replica owns this window. Not an error, and not a reason
-			// to count an attempt.
+			// Another replica owns this window. Not an error.
 			continue
 		}
 
-		if attempt > r.cfg.MaxAttempts {
+		if spent >= r.cfg.MaxAttempts {
 			r.cfg.Logf("[%s] %s exceeded %d recovery attempts — abandoning it",
 				r.cfg.Name, job.Key, r.cfg.MaxAttempts)
 			if r.cfg.Abandon == nil {
@@ -270,11 +283,20 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 			continue
 		}
 
-		if err := r.cfg.Recover(sweepCtx, job, attempt); err != nil {
+		// spent+1 is what this recovery will become once a worker claims it and
+		// calls RecordAttempt. It is advisory: if the task is lost in transit or
+		// waits out the window in a backlog, no attempt is recorded and the next
+		// window simply re-enqueues. That is the intended trade — a job is only
+		// charged for runs that really happened, so a stalled queue no longer
+		// fails work that nothing is wrong with. It also means a fleet that
+		// consumes nothing at all is retried indefinitely rather than failing
+		// every job in flight, which is the right way round: the jobs are not
+		// the broken thing.
+		if err := r.cfg.Recover(sweepCtx, job, spent+1); err != nil {
 			r.cfg.Logf("[%s] recover %s: %v", r.cfg.Name, job.Key, err)
 			continue
 		}
-		r.cfg.Logf("[%s] recovered %s attempt=%d", r.cfg.Name, job.Key, attempt)
+		r.cfg.Logf("[%s] re-enqueued %s attempt=%d", r.cfg.Name, job.Key, spent+1)
 	}
 }
 
@@ -283,4 +305,11 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 // an unrelated incident later.
 func (r *Reconciler) Clear(ctx context.Context, key string) error {
 	return r.cfg.Guard.Clear(ctx, key)
+}
+
+// RecordAttempt charges the job one recovery attempt. Call it from the worker
+// at the moment it claims a job a previous run abandoned — that is what the
+// budget is meant to ration. A first run of a fresh job is not an attempt.
+func (r *Reconciler) RecordAttempt(ctx context.Context, key string) (int, error) {
+	return r.cfg.Guard.RecordAttempt(ctx, key, r.cfg.AttemptTTL)
 }

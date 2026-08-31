@@ -50,6 +50,12 @@ lease := leasedwork.NewLease(leasedwork.Config[[]Block]{
 stop := lease.StartRenewal(context.WithoutCancel(ctx))
 defer stop()
 
+// This run is taking over a job a previous run abandoned, so charge it one
+// attempt. A first run of a fresh job charges nothing.
+if wasAbandoned {
+    reconciler.RecordAttempt(ctx, jobKey)
+}
+
 for _, step := range steps {
     if lease.Lost() {
         return nil // someone else owns this now; anything we produce is discarded
@@ -108,13 +114,23 @@ reverse order leaves a payload pointing at state that was never persisted, which
 is the broken resume this package exists to prevent.
 
 **The sweep is deduplicated across replicas.** Every replica sweeping is fine and
-wanted. But the attempt counter must be incremented once per *staleness window*,
-not once per replica per window. Without that, a three-replica deployment spends
-a three-attempt budget in a single sweep, and a four-replica one marks the job
+wanted. But a job must be acted on once per *staleness window*, not once per
+replica per window. Without that, a three-replica deployment spends a
+three-attempt budget in a single sweep, and a four-replica one marks the job
 permanently failed in the very sweep the other three re-enqueued it — racing a
-worker about to pick it up and succeed. `Guard.Begin` is what collapses that
-back to one action per window; `TestReplicasDoNotMultiplyAttempts` is the
-regression test.
+worker about to pick it up and succeed. `Guard.BeginWindow` collapses that back
+to one action per window; `TestReplicasDoNotMultiplyAttempts` is the regression
+test.
+
+**The budget counts runs, not sightings.** `Guard.RecordAttempt` is called by the
+*worker*, at the moment it claims a job a previous run abandoned — never by the
+sweep. Counting at sweep time counts noticing: a queue deep enough that a
+re-enqueued job waits out its window burns the whole budget without the job ever
+starting, so a backlog fails user work that nothing is wrong with
+(`TestBacklogDoesNotBurnBudget`). The trade is that a fleet consuming nothing at
+all retries indefinitely instead of failing everything in flight — which is the
+right way round, because the jobs are not the broken thing. Enqueues stay bounded
+at one per window, and the duplicate is a no-op against the claim.
 
 **One stale threshold, shared.** Whoever claims a job and whoever sweeps for
 stale ones must use the same constant. Two independently tuned thresholds can

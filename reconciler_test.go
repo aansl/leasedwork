@@ -21,7 +21,7 @@ func newMemGuard() *memGuard {
 	return &memGuard{locked: map[string]bool{}, attempts: map[string]int{}}
 }
 
-func (g *memGuard) Begin(_ context.Context, key string, _, _ time.Duration) (int, bool, error) {
+func (g *memGuard) BeginWindow(_ context.Context, key string, _ time.Duration) (int, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.err != nil {
@@ -31,8 +31,14 @@ func (g *memGuard) Begin(_ context.Context, key string, _, _ time.Duration) (int
 		return 0, false, nil
 	}
 	g.locked[key] = true
-	g.attempts[key]++
 	return g.attempts[key], true, nil
+}
+
+func (g *memGuard) RecordAttempt(_ context.Context, key string, _ time.Duration) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.attempts[key]++
+	return g.attempts[key], nil
 }
 
 func (g *memGuard) Clear(_ context.Context, key string) error {
@@ -121,19 +127,24 @@ func TestReplicasDoNotMultiplyAttempts(t *testing.T) {
 	if abandoned != 0 {
 		t.Fatalf("abandon calls = %d, want 0 — budget was spent in one sweep", abandoned)
 	}
-	if g.attempts["job-1"] != 1 {
-		t.Fatalf("attempts = %d, want 1", g.attempts["job-1"])
+	if g.attempts["job-1"] != 0 {
+		t.Fatalf("attempts = %d, want 0 — the sweep charged an attempt nobody ran", g.attempts["job-1"])
 	}
 }
 
-// The budget must be spent over windows, one attempt each, not per replica.
-func TestAttemptsAreSpentOnePerWindow(t *testing.T) {
+// The budget rations runs that actually happened, so a worker must claim the
+// job for an attempt to be charged.
+func TestAttemptsAreChargedByWorkersNotSweeps(t *testing.T) {
 	g := newMemGuard()
 	rec := &recorder{}
 	r := newTestReconciler(g, rec, 3)
 
 	for i := 0; i < 3; i++ {
 		r.Sweep(context.Background())
+		// A worker dequeues the retry and claims the job, which is what counts.
+		if _, err := r.RecordAttempt(context.Background(), "job-1"); err != nil {
+			t.Fatal(err)
+		}
 		g.expireWindow()
 	}
 
@@ -145,7 +156,7 @@ func TestAttemptsAreSpentOnePerWindow(t *testing.T) {
 		t.Fatalf("abandon calls = %d, want 0", abandoned)
 	}
 
-	// Fourth window exhausts the budget.
+	// Fourth window: three real runs have been spent, so the budget is gone.
 	r.Sweep(context.Background())
 	recovered, abandoned = rec.counts()
 	if recovered != 3 {
@@ -156,14 +167,61 @@ func TestAttemptsAreSpentOnePerWindow(t *testing.T) {
 	}
 }
 
+// Counting at sweep time counted *noticing* rather than *running*: a queue deep
+// enough that a re-enqueued job waited out its window burned the whole budget
+// without the job ever starting, failing user work that nothing was wrong with.
+func TestBacklogDoesNotBurnBudget(t *testing.T) {
+	g := newMemGuard()
+	rec := &recorder{}
+	r := newTestReconciler(g, rec, 3)
+
+	// Ten windows pass with the task sitting in a backed-up queue: it is
+	// re-enqueued but never claimed, so no attempt is ever recorded.
+	for i := 0; i < 10; i++ {
+		r.Sweep(context.Background())
+		g.expireWindow()
+	}
+
+	recovered, abandoned := rec.counts()
+	if abandoned != 0 {
+		t.Fatalf("abandon calls = %d, want 0 — a backlog failed a healthy job", abandoned)
+	}
+	if recovered != 10 {
+		t.Fatalf("recover calls = %d, want 10 (one per window)", recovered)
+	}
+}
+
+// The attempt passed to Recover is the number this run will become.
+func TestRecoverSeesNextAttemptNumber(t *testing.T) {
+	g := newMemGuard()
+	rec := &recorder{}
+	r := newTestReconciler(g, rec, 3)
+
+	r.Sweep(context.Background())
+	if _, err := r.RecordAttempt(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+	g.expireWindow()
+	r.Sweep(context.Background())
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.recovered) != 2 || rec.recovered[0] != 1 || rec.recovered[1] != 2 {
+		t.Fatalf("attempt numbers = %v, want [1 2]", rec.recovered)
+	}
+}
+
 func TestAbandonClearsHistory(t *testing.T) {
 	g := newMemGuard()
 	rec := &recorder{}
 	r := newTestReconciler(g, rec, 1)
 
-	r.Sweep(context.Background()) // attempt 1: recovered
+	r.Sweep(context.Background()) // re-enqueued
+	if _, err := r.RecordAttempt(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
 	g.expireWindow()
-	r.Sweep(context.Background()) // attempt 2: over budget, abandoned
+	r.Sweep(context.Background()) // budget of 1 is spent, abandoned
 
 	g.mu.Lock()
 	_, stillCounted := g.attempts["job-1"]
