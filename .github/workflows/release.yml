@@ -1,0 +1,55 @@
+# Publishing a Go module is just pushing a tag, so this is deliberately manual
+# rather than firing on every push to main: auto-tagging each merge would burn a
+# version number per commit and give consumers no signal about what changed.
+#
+# CI on main is what proves main is releasable; this is what declares it.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver tag to publish, e.g. v0.2.0"
+        required: true
+        type: string
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: validate version
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must look like v1.2.3"; exit 1
+          fi
+          if git rev-parse "${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "tag ${{ inputs.version }} already exists"; exit 1
+          fi
+
+      # Never publish a tag that does not build and pass its tests: a Go module
+      # version is immutable once fetched, so a bad tag cannot be taken back.
+      - name: verify
+        run: |
+          go build ./...
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ inputs.version }}" -m "${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
+          gh release create "${{ inputs.version }}" --generate-notes
